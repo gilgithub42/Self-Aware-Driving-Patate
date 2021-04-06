@@ -18,8 +18,16 @@ from skimage import transform, color, exposure
 from skimage.transform import rotate
 from skimage.viewer import ImageViewer
 from collections import deque
+
+import gym_donkeycar
+import pickle
+
+from multiprocessing import Process, shared_memory, Lock
+
+from config import cte_config
+
 from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers import Adam, Adagrad
 from tensorflow.keras.models import Sequential
 # from tensorflow.keras.initializers import normal, identity
 from tensorflow.keras.initializers import identity
@@ -30,13 +38,6 @@ from tensorflow.keras.layers import Conv2D, MaxPooling2D
 import tensorflow as tf
 # from tensorflow.keras import backend as K
 from tensorflow.compat.v1.keras import backend as K
-import gym_donkeycar
-
-
-
-
-
-from config import cte_config
 
 EPISODES = 20000
 img_rows, img_cols = 80, 80
@@ -46,7 +47,7 @@ turn_bins = 7
 img_channels = 4 # We stack 4 frames
 
 class DQNAgent:
-    def __init__(self, state_size, action_space, train=True):
+    def __init__(self, state_size, action_space, shm, lock, train=True):
         self.t = 0
         self.max_Q = 0
         self.train = train
@@ -71,31 +72,37 @@ class DQNAgent:
         self.memory = deque(maxlen=10000)
         # Create main model and target model
         self.model = self.build_model()
-        self.target_model = self.build_model()
+        self.target_model = self.build_model(trainable=False)
+        self.update_target_model()
         # Copy the model to target model
         # --> initialize the target model so that the parameters of model & target model to be same
-        self.update_target_model()
+        if (shm is not None):
+            self.model.set_weights(pickle.loads(shm.buf))
+            self.target_model.set_weights(pickle.loads(shm.buf))
+        self.shm = shm
+        self.lock = lock
 
-    def build_model(self):
+    def build_model(self, trainable = True):
         model = Sequential()
-        model.add(Conv2D(24, (5, 5), strides=(2, 2), padding="same",input_shape=(img_rows,img_cols,img_channels)))  #80*80*4
+        model.add(Conv2D(24, (5, 5), strides=(2, 2), padding="same",input_shape=(img_rows,img_cols,img_channels), trainable=trainable))  #80*80*4
         model.add(Activation('relu'))
-        model.add(Conv2D(32, (5, 5), strides=(2, 2), padding="same"))
+        model.add(Conv2D(32, (5, 5), strides=(2, 2), padding="same", trainable=trainable))
         model.add(Activation('relu'))
-        model.add(Conv2D(64, (5, 5), strides=(2, 2), padding="same"))
+        model.add(Conv2D(64, (5, 5), strides=(2, 2), padding="same", trainable=trainable))
         model.add(Activation('relu'))
-        model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same"))
+        model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same", trainable=trainable))
         model.add(Activation('relu'))
-        model.add(Conv2D(64, (3, 3), strides=(1, 1), padding="same"))
+        model.add(Conv2D(64, (3, 3), strides=(1, 1), padding="same", trainable=trainable))
         model.add(Activation('relu'))
         model.add(Flatten())
-        model.add(Dense(512))
+        model.add(Dense(512, trainable=trainable))
         model.add(Activation('relu'))
         # 15 categorical bins for Steering angles
-        model.add(Dense(turn_bins, activation="linear")) 
-        adam = Adam(lr=self.learning_rate)
-        model.compile(loss='mse',optimizer=adam)
+        model.add(Dense(turn_bins, activation="linear", trainable=trainable)) 
+        # adagrad = Adagrad(lr=self.learning_rate)
+        model.compile(loss='mse', optimizer='SGD')
         return model
+
 
     def rgb2gray(self, rgb):
         '''
@@ -103,14 +110,17 @@ class DQNAgent:
         '''
         return np.dot(rgb[...,:3], [0.299, 0.587, 0.114])
 
+
     def process_image(self, obs):
         obs = self.rgb2gray(obs)
         obs = cv2.resize(obs, (img_rows, img_cols))
         return obs
 
+
     def update_target_model(self):
         self.target_model.set_weights(self.model.get_weights())
     # Get action from model using epsilon-greedy policy
+
 
     def get_action(self, s_t):
         if np.random.rand() <= self.epsilon:
@@ -121,12 +131,15 @@ class DQNAgent:
             # Convert q array to steering value
             return linear_unbin(q_value[0])
 
+
     def replay_memory(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
+
 
     def update_epsilon(self):
         if self.epsilon > self.epsilon_min:
             self.epsilon -= (self.initial_epsilon - self.epsilon_min) / self.explore
+
 
     def train_replay(self):
         if len(self.memory) < self.train_start:
@@ -147,8 +160,12 @@ class DQNAgent:
                 a = np.argmax(target_val[i])
                 targets[i][action_t[i]] = reward_t[i] + self.discount_factor * (target_val_[i][a])
         self.model.train_on_batch(state_t, targets)
+
+
     def load_model(self, name):
         self.model.load_weights(name)
+
+
     # Save the model which is under training
     def save_model(self, name):
         self.model.save_weights(name)
@@ -187,11 +204,14 @@ def linear_unbin(arr):
     # print("unbin", a, b)
     return a
 
-def run_ddqn(args):
+def run_ddqn(args, shm_name, lock):
     '''
-    run a DDQN training session, or test it's result, with the donkey simulator
+    run a DDQN training session, or test its result, with the donkey simulator
     '''
     # only needed if TF==1.13.1
+    shm = shared_memory.SharedMemory(name = shm_name)
+
+
     config = tf.compat.v1.ConfigProto(log_device_placement=True)
     config.gpu_options.allow_growth = True
     print(config)
@@ -224,7 +244,8 @@ def run_ddqn(args):
     state_size = (img_rows, img_cols, img_channels)
     action_space = env.action_space # Steering and Throttle
     try:
-        agent = DQNAgent(state_size, action_space, train=not args.test)
+
+        agent = DQNAgent(state_size, action_space, shm, lock, train=not args.test)
         throttle = args.throttle # Set throttle as constant value
         episodes = []
         if os.path.exists(args.model):
@@ -248,7 +269,6 @@ def run_ddqn(args):
                 cte_corrected = cte + cte_config.cte_offset
                 # print("speed : ", env.viewer.handler.speed)
                 done = cte_config.done_func(cte_corrected)
-                print(cte_corrected, done)
                 #if (env.viewer.handler.cte > 7 + 355):
                 #    done = True
                 if (done):
@@ -278,30 +298,8 @@ def run_ddqn(args):
                         agent.save_model(args.model)
                     print("episode:", e, "  memory length:", len(agent.memory),
                         "  epsilon:", agent.epsilon, " episode length:", episode_len)
-    except KeyboardInterrupt:
-        print("stopping run...")
+    except Exception as e:
+        print(f"{e}\nstopping run...")
     finally:
         env.unwrapped.close()
 
-if __name__ == "__main__":
-    # Initialize the donkey environment
-    # where env_name one of:
-    env_list = [
-        "donkey-warehouse-v0",
-        "donkey-generated-roads-v0",
-        "donkey-avc-sparkfun-v0",
-        "donkey-generated-track-v0",
-        "donkey-roboracingleague-track-v0",
-        "donkey-waveshare-v0",
-        "donkey-minimonaco-track-v0",
-        "donkey-warren-track-v0"
-    ]
-    parser = argparse.ArgumentParser(description='ddqn')
-    parser.add_argument('--sim', type=str, default="manual", help='path to unity simulator. maybe be left at manual if you would like to start the sim on your own.')
-    parser.add_argument('--model', type=str, default="rl_driver.h5", help='path to model')
-    parser.add_argument('--test', action="store_true", help='agent uses learned model to navigate env')
-    parser.add_argument('--port', type=int, default=9091, help='port to use for websockets')
-    parser.add_argument('--throttle', type=float, default=0.3, help='constant throttle for driving')
-    parser.add_argument('--env_name', type=str, default="donkey-generated-roads-v0", help='name of donkey sim environment', choices=env_list)
-    args = parser.parse_args()
-    run_ddqn(args)
